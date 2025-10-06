@@ -1,0 +1,32 @@
+{
+  "sales": {
+    "name": "Sales Team",
+    "number": "+11111111111",
+    "description": "For pricing, quotes, and new customer inquiries"
+  },
+  "support": {
+    "name": "Technical Support",
+    "number": "+22222222222",
+    "description": "For existing customers needing technical help"
+  },
+  "John": {
+    "name": "John Smith",
+    "number": "+33333333333",
+    "description": "Founder - for strategic discussions"
+  },
+  "cohen": {
+    "name": "Cohen Smith",
+    "number": "+44444444444",
+    "description": "Stud Employee - general inquiries"
+  },
+  "noah": {
+    "name": "Noah Smith",
+    "number": "+55555555555",
+    "description": "Stud Employee - general inquiries"
+  },
+  "main": {
+    "name": "Main Office",
+    "number": "+66666666666",
+    "description": "Main office line"
+  }
+}

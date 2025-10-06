@@ -1,0 +1,20 @@
+{
+  "11234567890": {
+    "name": "John Rogers",
+    "company": "Apex AI Solutions",
+    "role": "Founder",
+    "vip": true,
+    "notes": "Founder - provide detailed technical information",
+    "lastContact": "2024-10-01",
+    "preferredGreeting": "Hi John! What can I help you with today?"
+  },
+  "110987654321": {
+    "name": "Matt Holbert",
+    "company": "Apex AI Solutions",
+    "role": "Founder",
+    "vip": true,
+    "notes": "Founder - provide detailed technical information",
+    "lastContact": "2024-10-01",
+    "preferredGreeting": "Hi Matt! What can I help you with today?"
+  }
+}

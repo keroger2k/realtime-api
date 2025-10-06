@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  realtime-api:
+    build: .
+    container_name: apex-realtime-api
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_WEBHOOK_SECRET=${OPENAI_WEBHOOK_SECRET}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-realtime-preview-2024-12-17}
+      - OPENAI_VOICE=${OPENAI_VOICE:-shimmer}
+      - GREETING_DELAY_MS=${GREETING_DELAY_MS:-400}
+      - PORT=${PORT:-9000}
+      - VERBOSE_LOGGING=${VERBOSE_LOGGING:-false}
+    volumes:
+      # Mount config directory for easy updates without rebuilding
+      - ./config:/app/config:ro
+    networks:
+      - realtime-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflare-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://realtime-api:9000
+    networks:
+      - realtime-network
+    depends_on:
+      - realtime-api
+
+networks:
+  realtime-network:
+    driver: bridge
