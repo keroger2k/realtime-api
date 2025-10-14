@@ -518,14 +518,28 @@ async function handleFunctionCalls(callId) {
               const args = JSON.parse(argsJson);
               const scheduleStartTime = Date.now();
 
-              result = await handleCalendlyScheduling(args);
+              try {
+                result = await handleCalendlyScheduling(args);
 
-              logEvent('info', 'calendly', callId, 'Calendly scheduling completed', {
-                name: args.name,
-                email: args.email,
-                success: result.success,
-                durationMs: Date.now() - scheduleStartTime
-              });
+                logEvent('info', 'calendly', callId, 'Calendly scheduling completed', {
+                  name: args.name,
+                  email: args.email,
+                  success: result.success,
+                  durationMs: Date.now() - scheduleStartTime
+                });
+              } catch (error) {
+                logEvent('error', 'calendly', callId, 'Calendly scheduling exception', {
+                  error: error.message,
+                  stack: error.stack,
+                  args,
+                  durationMs: Date.now() - scheduleStartTime
+                });
+
+                result = {
+                  success: false,
+                  message: "I encountered an error while trying to schedule your meeting. Let me have someone call you back to assist with booking."
+                };
+              }
             }
 
             // Send function call result back to AI
