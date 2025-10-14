@@ -6,6 +6,7 @@ import WebSocket from "ws";
 import { buildInstructions, buildGreeting } from './lib/instructionBuilder.js';
 import { transferCall, getTransferTool } from './lib/callTransfer.js';
 import { clearCache } from './lib/dataAccess.js';
+import { handleCalendlyScheduling, getCalendlyTool } from './lib/calendlyIntegration.js';
 
 // Validate required environment variables at startup
 const requiredEnvVars = ['OPENAI_API_KEY', 'OPENAI_WEBHOOK_SECRET'];
@@ -169,7 +170,10 @@ async function acceptCall(callId, instructions, retries = 3) {
               format: "pcm16"
             }
           },
-          tools: [getTransferTool()]  // Add call transfer capability
+          tools: [
+            getTransferTool(),      // Call transfer capability
+            getCalendlyTool()       // Calendly scheduling capability
+          ]
         }),
       }
     );
@@ -496,19 +500,36 @@ async function handleFunctionCalls(callId) {
               args: argsJson
             });
 
+            let result = null;
+
             if (name === "transfer_call") {
               const args = JSON.parse(argsJson);
               const transferStartTime = Date.now();
 
-              const result = await transferCall(callId, args.destination);
+              result = await transferCall(callId, args.destination);
 
               logEvent('info', 'transfer', callId, 'Transfer completed', {
                 destination: args.destination,
                 success: result.success,
                 durationMs: Date.now() - transferStartTime
               });
+            }
+            else if (name === "schedule_calendly_meeting") {
+              const args = JSON.parse(argsJson);
+              const scheduleStartTime = Date.now();
 
-              // Send function call result back
+              result = await handleCalendlyScheduling(args);
+
+              logEvent('info', 'calendly', callId, 'Calendly scheduling completed', {
+                name: args.name,
+                email: args.email,
+                success: result.success,
+                durationMs: Date.now() - scheduleStartTime
+              });
+            }
+
+            // Send function call result back to AI
+            if (result) {
               ws.send(JSON.stringify({
                 type: "conversation.item.create",
                 item: {
@@ -567,8 +588,13 @@ async function handleFunctionCalls(callId) {
           messageCount: state?.messageCount || 0
         });
 
-        // Don't reconnect on normal closure
-        if (code === 1000) {
+        // Don't reconnect on normal closure (1000) or abnormal closure after long session (1006)
+        // Code 1006 after 30+ seconds usually means the call ended naturally
+        if (code === 1000 || (code === 1006 && sessionDuration > 30000)) {
+          logEvent('info', 'function', callId, 'Call ended normally, not reconnecting', {
+            code,
+            sessionDurationMs: sessionDuration
+          });
           resolve(true);
         } else if (reconnectAttempts < maxReconnectAttempts) {
           reconnectAttempts++;
