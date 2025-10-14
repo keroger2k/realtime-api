@@ -228,23 +228,27 @@ async function triggerGreeting(callId, greetingMessage, reason) {
 
   return new Promise((resolve) => {
     let connectionTimeout = null;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 3;
+    let ws = null;
 
-    const ws = new WebSocket(
-      `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`,
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-      }
-    );
+    const connect = () => {
+      ws = new WebSocket(
+        `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`,
+        {
+          headers: {
+            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          },
+        }
+      );
 
-    // Connection timeout (10 seconds)
-    connectionTimeout = setTimeout(() => {
-      logEvent('error', 'greeting', callId, 'WebSocket connection timeout');
-      ws?.close();
-      greetedCalls.delete(callId);
-      resolve(false);
-    }, 10000);
+      // Connection timeout (10 seconds)
+      connectionTimeout = setTimeout(() => {
+        logEvent('error', 'greeting', callId, 'WebSocket connection timeout');
+        ws?.close();
+        greetedCalls.delete(callId);
+        resolve(false);
+      }, 10000);
 
     ws.on("open", () => {
       clearTimeout(connectionTimeout);
@@ -277,25 +281,46 @@ async function triggerGreeting(callId, greetingMessage, reason) {
       }
     });
 
-    ws.on("error", (error) => {
-      clearTimeout(connectionTimeout);
-      logEvent('error', 'greeting', callId, 'WebSocket error', {
-        error: error.message,
-        code: error.code
-      });
-      greetedCalls.delete(callId);
-      resolve(false);
-    });
+      ws.on("error", (error) => {
+        clearTimeout(connectionTimeout);
 
-    ws.on("close", (code, reason) => {
-      clearTimeout(connectionTimeout);
-      if (VERBOSE_LOGGING) {
-        logEvent('debug', 'greeting', callId, 'WebSocket disconnected', {
-          code,
-          reason: reason.toString()
-        });
-      }
-    });
+        // Retry on 404 or connection errors
+        if ((error.message.includes('404') || error.message.includes('Unexpected server response'))
+            && reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const backoffMs = 500 * reconnectAttempts; // 500ms, 1000ms, 1500ms
+
+          logEvent('warn', 'greeting', callId, 'WebSocket error, retrying', {
+            error: error.message,
+            attempt: reconnectAttempts,
+            maxAttempts: maxReconnectAttempts,
+            delayMs: backoffMs
+          });
+
+          setTimeout(connect, backoffMs);
+        } else {
+          logEvent('error', 'greeting', callId, 'WebSocket error, no retry', {
+            error: error.message,
+            code: error.code,
+            attempts: reconnectAttempts
+          });
+          greetedCalls.delete(callId);
+          resolve(false);
+        }
+      });
+
+      ws.on("close", (code, reason) => {
+        clearTimeout(connectionTimeout);
+        if (VERBOSE_LOGGING) {
+          logEvent('debug', 'greeting', callId, 'WebSocket disconnected', {
+            code,
+            reason: reason.toString()
+          });
+        }
+      });
+    };
+
+    connect(); // Start the initial connection
   });
 }
 
@@ -323,6 +348,10 @@ async function handleIncomingCall(data, res) {
     logEvent('info', 'incoming', call_id, 'Call setup completed', {
       durationMs: callSetupDuration
     });
+
+    // Wait for OpenAI to prepare the call for WebSocket connections
+    // This prevents 404 errors when connecting immediately after acceptance
+    await new Promise(resolve => setTimeout(resolve, 800));
 
     startFunctionHandler(call_id);
 
