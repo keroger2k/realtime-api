@@ -74,11 +74,17 @@ Call transferred to John's phone
 1. Create Twilio a free account [https://www.twilio.com/try-twilio](https://www.twilio.com/try-twilio)
    - Comes with $15.00 credit
 2. Buy a phone number (Twilio Console → Phone Numbers → Buy a Number)
-3. Create SIP Trunk:
+3. Create SIP Domain:
+   - Go to: Elastic SIP Trunking → SIP Domains → Create new SIP Domain
+   - Name it (e.g., "apexaisolutions.pstn.ashburn.twilio.com")
+   - Under "Access Control", create an ACL to allow incoming traffic from OpenAI
+   - Add IP addresses to ACL to allow OpenAI's infrastructure
+4. Create SIP Trunk:
    - Go to: Elastic SIP Trunking → Trunks → Create new SIP Trunk
    - Name it (e.g., "OpenAI Realtime")
-   - Under "Origination", add your OpenAI SIP URI
-4. Link your phone number to the SIP Trunk:
+   - Under "Origination", add your OpenAI SIP URI: `sip:proj_YOUR_PROJECT_ID@sip.api.openai.com`
+   - Under "Transfer Settings", **enable "Enable PSTN transfers"** (CRITICAL for call transfers)
+5. Link your phone number to the SIP Trunk:
    - Phone Numbers → Manage → Active Numbers
    - Select your number
    - Under "Voice & Fax", configure to use your SIP Trunk
@@ -185,7 +191,7 @@ What can you ask:
 
 ## 📞 Call Transfer Feature
 
-The AI can intelligently transfer calls to team members or departments.
+The AI can intelligently transfer calls to team members or departments using SIP REFER protocol.
 
 ### How It Works
 
@@ -197,9 +203,34 @@ When a caller says:
 The AI will:
 1. Confirm the transfer
 2. Say: "Let me transfer you to [person]. Please hold for a moment."
-3. Execute the transfer using OpenAI's Refer API
+3. Execute the transfer using OpenAI's Refer API (SIP REFER)
+4. Route the call through Twilio's SIP infrastructure to the destination
 
-### Configuration
+### Critical Twilio Configuration
+
+**IMPORTANT:** Call transfers will fail with "SIP transfer is disabled" (Error 32218) unless properly configured.
+
+#### Step 1: Create SIP Domain
+1. Go to Twilio Console → Elastic SIP Trunking → SIP Domains
+2. Create a new SIP Domain (e.g., `apexaisolutions.pstn.ashburn.twilio.com`)
+3. Under "Access Control":
+   - Create a new IP Access Control List (ACL)
+   - Name it (e.g., "OpenAI Realtime API")
+   - Add IP ranges to allow OpenAI's infrastructure to reach your domain
+
+#### Step 2: Enable Transfers on SIP Trunk
+1. Go to Twilio Console → Elastic SIP Trunking → Trunks
+2. Select your trunk connected to OpenAI
+3. Scroll to "Transfer Settings"
+4. **Enable "Enable PSTN transfers"** ✅ (This is critical!)
+5. Save changes
+
+Without this setting enabled, all transfer attempts will result in:
+```
+Error 32218: SIP transfer is disabled
+```
+
+#### Step 3: Configure Transfer Numbers
 
 Edit `config/transfer-numbers.json`:
 
@@ -211,11 +242,16 @@ Edit `config/transfer-numbers.json`:
     "description": "For pricing, quotes, and new customer inquiries"
   },
   "john": {
-    "name": "Johh Doe",
+    "name": "John Doe",
     "number": "+1309xxxxxxx",
     "description": "Founder - for strategic discussions"
   }
 }
+```
+
+The system automatically converts phone numbers to Twilio SIP URIs:
+```
++13098258257 → sip:+13098258257@apexaisolutions.pstn.ashburn.twilio.com
 ```
 
 **Add new destinations:**
@@ -344,7 +380,8 @@ export async function transferCall(callId, transferKey) {
   // Look up transfer destination from config
   const transferInfo = await getTransferNumber(transferKey);
 
-  const targetUri = `tel:${transferInfo.number}`;
+  // Convert to Twilio SIP URI format for proper routing
+  const targetUri = `sip:${transferInfo.number}@apexaisolutions.pstn.ashburn.twilio.com`;
 
   // Use OpenAI Refer API (SIP REFER)
   const response = await fetch(
@@ -368,9 +405,11 @@ export async function transferCall(callId, transferKey) {
 
 **How it works:**
 - Looks up phone number from `config/transfer-numbers.json`
-- Uses OpenAI's `/refer` endpoint (similar to SIP REFER)
-- Handles errors gracefully
-- Logs all transfer attempts
+- Converts to Twilio SIP URI: `sip:+1234567890@your-domain.pstn.ashburn.twilio.com`
+- Uses OpenAI's `/refer` endpoint (executes SIP REFER protocol)
+- Twilio routes the call through PSTN to destination number
+- Handles errors gracefully with detailed logging
+- Logs all transfer attempts with request IDs
 
 ### 5. Function Call Handler ([server.js](server.js:248))
 
@@ -537,12 +576,33 @@ curl https://your-url.trycloudflare.com/health
 ```
 
 **Transfers not working:**
+
+Common issues and solutions:
+
+1. **Error 32218: "SIP transfer is disabled"**
+   - Go to Twilio Console → Elastic SIP Trunking → Trunks
+   - Select your trunk → Transfer Settings
+   - Enable "Enable PSTN transfers" ✅
+   - Save changes (no code restart needed)
+
+2. **500 Internal Server Error on transfer**
+   - Verify your SIP domain is correct in `lib/callTransfer.js`
+   - Should match: `sip:+1234567890@your-domain.pstn.ashburn.twilio.com`
+   - Rebuild after code changes: `docker-compose up -d --build`
+
+3. **Call disconnects immediately on transfer**
+   - Check Twilio SIP Domain ACL allows OpenAI IPs
+   - Verify transfer number format in config (must start with +)
+
 ```bash
 # Check transfer config
 cat config/transfer-numbers.json
 
 # View transfer logs
 docker-compose logs -f | grep transfer
+
+# Test transfer with verbose logging
+VERBOSE_LOGGING=true docker-compose up -d
 
 # Restart after config changes
 docker-compose restart

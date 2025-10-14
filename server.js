@@ -5,16 +5,28 @@ import fetch from "node-fetch";
 import WebSocket from "ws";
 import { buildInstructions, buildGreeting } from './lib/instructionBuilder.js';
 import { transferCall, getTransferTool } from './lib/callTransfer.js';
+import { clearCache } from './lib/dataAccess.js';
+
+// Validate required environment variables at startup
+const requiredEnvVars = ['OPENAI_API_KEY', 'OPENAI_WEBHOOK_SECRET'];
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`);
+  console.error('Please set these variables in your .env file or environment');
+  process.exit(1);
+}
 
 const app = express();
 const greetedCalls = new Set();
 const activeFunctionHandlers = new Set();
+const callStates = new Map(); // Track call state and metadata
 
 // Configuration
 const GREETING_DELAY_MS = Number(process.env.GREETING_DELAY_MS ?? 400);
 const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-realtime-preview-2024-12-17";
 const VOICE = process.env.OPENAI_VOICE ?? "shimmer";
-const PORT = Number(process.env.PORT ?? 8000);
+const PORT = Number(process.env.PORT ?? 9000);
 const VERBOSE_LOGGING = process.env.VERBOSE_LOGGING === "true";
 
 app.use(
@@ -25,7 +37,40 @@ app.use(
   })
 );
 
-console.log("Webhook secret loaded:", process.env.OPENAI_WEBHOOK_SECRET ? "yes" : "no");
+// Structured logging system
+function logEvent(level, category, callId, message, metadata = {}) {
+  const timestamp = new Date().toISOString();
+  const logEntry = {
+    timestamp,
+    level,
+    category,
+    callId: callId || 'system',
+    message,
+    ...metadata
+  };
+
+  // Use console methods based on level
+  if (level === 'error') {
+    console.error(JSON.stringify(logEntry));
+  } else if (level === 'warn') {
+    console.warn(JSON.stringify(logEntry));
+  } else if (VERBOSE_LOGGING || level === 'info') {
+    console.log(JSON.stringify(logEntry));
+  }
+}
+
+// Legacy log format for backwards compatibility
+function logSimple(message) {
+  console.log(message);
+}
+
+logEvent('info', 'startup', null, 'Server initializing', {
+  model: MODEL,
+  voice: VOICE,
+  port: PORT,
+  greetingDelay: GREETING_DELAY_MS,
+  verboseLogging: VERBOSE_LOGGING
+});
 
 function verifySignature(req) {
   const webhookId = req.get("webhook-id");
@@ -33,7 +78,11 @@ function verifySignature(req) {
   const signatureHeader = req.get("webhook-signature");
 
   if (!signatureHeader || !timestamp || !webhookId) {
-    console.warn("Missing signature headers", { webhookId, timestamp, signatureHeader });
+    logEvent('warn', 'webhook', null, 'Missing signature headers', {
+      hasWebhookId: !!webhookId,
+      hasTimestamp: !!timestamp,
+      hasSignature: !!signatureHeader
+    });
     return false;
   }
 
@@ -42,7 +91,7 @@ function verifySignature(req) {
   // Strip wwhsec_ prefix and base64-decode the secret
   const secretString = process.env.OPENAI_WEBHOOK_SECRET?.replace(/^whsec_/, '');
   if (!secretString) {
-    console.error("OPENAI_WEBHOOK_SECRET is not configured");
+    logEvent('error', 'webhook', null, 'OPENAI_WEBHOOK_SECRET not configured');
     return false;
   }
   const secret = Buffer.from(secretString, 'base64');
@@ -60,7 +109,10 @@ function verifySignature(req) {
 
   const valid = sigs.includes(expected);
   if (!valid) {
-    console.warn("Signature validation failed", { webhookId, timestamp, signatureHeader });
+    logEvent('warn', 'webhook', null, 'Signature validation failed', {
+      webhookId,
+      timestamp
+    });
   }
   return valid;
 }
@@ -87,6 +139,8 @@ function extractTwilioCallSid(sipHeaders) {
 }
 
 async function acceptCall(callId, instructions, retries = 3) {
+  const startTime = Date.now();
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     const response = await fetch(
       `https://api.openai.com/v1/realtime/calls/${encodeURIComponent(callId)}/accept`,
@@ -101,7 +155,19 @@ async function acceptCall(callId, instructions, retries = 3) {
           model: MODEL,
           instructions: instructions,
           audio: {
-            output: { voice: VOICE }
+            input: {
+              format: "pcm16",
+              turn_detection: {
+                type: "server_vad",
+                threshold: 0.5,
+                prefix_padding_ms: 300,
+                silence_duration_ms: 500
+              }
+            },
+            output: {
+              voice: VOICE,
+              format: "pcm16"
+            }
           },
           tools: [getTransferTool()]  // Add call transfer capability
         }),
@@ -109,6 +175,11 @@ async function acceptCall(callId, instructions, retries = 3) {
     );
 
     if (response.ok) {
+      const duration = Date.now() - startTime;
+      logEvent('info', 'accept', callId, 'Call accepted', {
+        durationMs: duration,
+        attempts: attempt
+      });
       return response;
     }
 
@@ -116,7 +187,10 @@ async function acceptCall(callId, instructions, retries = 3) {
 
     // Retry on 404 (call not ready yet)
     if (response.status === 404 && attempt < retries) {
-      console.log(`[accept] Call not ready yet (attempt ${attempt}/${retries}), retrying in 500ms...`);
+      logEvent('warn', 'accept', callId, 'Call not ready, retrying', {
+        attempt,
+        maxRetries: retries
+      });
       await new Promise(resolve => setTimeout(resolve, 500));
       continue;
     }
@@ -127,22 +201,25 @@ async function acceptCall(callId, instructions, retries = 3) {
 
 async function triggerGreeting(callId, greetingMessage, reason) {
   if (VERBOSE_LOGGING) {
-    console.log(`[greeting] called with callId=${callId} reason=${reason}`);
+    logEvent('debug', 'greeting', callId, 'Greeting function called', { reason });
   }
 
   if (!callId) {
-    console.warn(`[greeting] no call id; skip trigger (reason=${reason})`);
+    logEvent('warn', 'greeting', null, 'No call ID provided, skipping greeting', { reason });
     return false;
   }
 
   if (greetedCalls.has(callId)) {
     if (VERBOSE_LOGGING) {
-      console.log(`[greeting] already sent for call=${callId} (reason=${reason})`);
+      logEvent('debug', 'greeting', callId, 'Greeting already sent', { reason });
     }
     return true;
   }
 
-  console.log(`[greeting] triggering for call=${callId} with ${GREETING_DELAY_MS}ms delay`);
+  logEvent('info', 'greeting', callId, 'Triggering greeting', {
+    delayMs: GREETING_DELAY_MS,
+    reason
+  });
   greetedCalls.add(callId);
 
   if (GREETING_DELAY_MS > 0) {
@@ -150,6 +227,8 @@ async function triggerGreeting(callId, greetingMessage, reason) {
   }
 
   return new Promise((resolve) => {
+    let connectionTimeout = null;
+
     const ws = new WebSocket(
       `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`,
       {
@@ -159,8 +238,18 @@ async function triggerGreeting(callId, greetingMessage, reason) {
       }
     );
 
+    // Connection timeout (10 seconds)
+    connectionTimeout = setTimeout(() => {
+      logEvent('error', 'greeting', callId, 'WebSocket connection timeout');
+      ws?.close();
+      greetedCalls.delete(callId);
+      resolve(false);
+    }, 10000);
+
     ws.on("open", () => {
-      console.log(`[greeting] WebSocket connected for call=${callId}`);
+      clearTimeout(connectionTimeout);
+      logEvent('info', 'greeting', callId, 'WebSocket connected, sending greeting');
+
       ws.send(JSON.stringify({
         type: "response.create",
         response: {
@@ -175,30 +264,51 @@ async function triggerGreeting(callId, greetingMessage, reason) {
 
     ws.on("message", (data) => {
       if (VERBOSE_LOGGING) {
-        console.log(`[greeting] WebSocket message for call=${callId}:`, data.toString());
+        try {
+          const event = JSON.parse(data.toString());
+          logEvent('debug', 'greeting', callId, 'WebSocket message received', {
+            eventType: event.type
+          });
+        } catch (e) {
+          logEvent('debug', 'greeting', callId, 'WebSocket message received (raw)', {
+            data: data.toString().substring(0, 100)
+          });
+        }
       }
     });
 
     ws.on("error", (error) => {
-      console.error(`[greeting] WebSocket error for call=${callId}:`, error.message);
+      clearTimeout(connectionTimeout);
+      logEvent('error', 'greeting', callId, 'WebSocket error', {
+        error: error.message,
+        code: error.code
+      });
       greetedCalls.delete(callId);
       resolve(false);
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
+      clearTimeout(connectionTimeout);
       if (VERBOSE_LOGGING) {
-        console.log(`[greeting] WebSocket disconnected for call=${callId}`);
+        logEvent('debug', 'greeting', callId, 'WebSocket disconnected', {
+          code,
+          reason: reason.toString()
+        });
       }
     });
   });
 }
 
 async function handleIncomingCall(data, res) {
+  const startTime = Date.now();
   const { call_id } = data;
   const callerPhone = extractPhoneNumber(data.sip_headers);
   const twilioCallSid = extractTwilioCallSid(data.sip_headers);
 
-  console.log(`[incoming] call=${call_id} caller=${callerPhone} twilioSid=${twilioCallSid}`);
+  logEvent('info', 'incoming', call_id, 'Incoming call received', {
+    callerPhone,
+    twilioCallSid
+  });
 
   try {
     // Build personalized instructions and greeting based on caller
@@ -208,105 +318,284 @@ async function handleIncomingCall(data, res) {
     ]);
 
     await acceptCall(call_id, instructions);
-    console.log(`[incoming] call accepted for call=${call_id}`);
+
+    const callSetupDuration = Date.now() - startTime;
+    logEvent('info', 'incoming', call_id, 'Call setup completed', {
+      durationMs: callSetupDuration
+    });
 
     startFunctionHandler(call_id);
 
     // Trigger personalized greeting via WebSocket (non-blocking)
     triggerGreeting(call_id, greetingMessage, "after accept").catch(err => {
-      console.error(`[incoming] greeting failed for call=${call_id}:`, err);
+      logEvent('error', 'incoming', call_id, 'Greeting failed', {
+        error: err.message,
+        stack: err.stack
+      });
     });
 
     return res.status(200).send("ok");
   } catch (error) {
-    console.error(`[incoming] error accepting call=${call_id}:`, error.message);
+    logEvent('error', 'incoming', call_id, 'Call setup failed', {
+      error: error.message,
+      stack: error.stack,
+      durationMs: Date.now() - startTime
+    });
     return res.status(500).send("Accept failed");
   }
 }
 
 function startFunctionHandler(callId) {
   if (!callId) {
+    logEvent('warn', 'function', null, 'Cannot start function handler without call ID');
     return;
   }
 
   if (activeFunctionHandlers.has(callId)) {
+    logEvent('debug', 'function', callId, 'Function handler already active');
     return;
   }
 
-  console.log(`[function] Launching handler for call=${callId}`);
+  logEvent('info', 'function', callId, 'Launching function handler');
   activeFunctionHandlers.add(callId);
 
   handleFunctionCalls(callId)
     .catch(err => {
-      console.error(`[function] Handler error for call=${callId}:`, err);
+      logEvent('error', 'function', callId, 'Handler error', {
+        error: err.message,
+        stack: err.stack
+      });
     })
     .finally(() => {
       activeFunctionHandlers.delete(callId);
+      logEvent('info', 'function', callId, 'Function handler stopped');
     });
 }
 
 async function handleFunctionCalls(callId) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(
-      `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`,
-      {
-        headers: {
-          "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-        },
-      }
-    );
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 3;
+    let ws = null;
+    let connectionTimeout = null;
+    let heartbeatInterval = null;
 
-    ws.on("open", () => {
-      console.log(`[function] WebSocket connected for call=${callId}`);
-    });
-
-    ws.on("message", async (data) => {
-      const event = JSON.parse(data.toString());
-
-      if (event.type === "response.function_call_arguments.done") {
-        const { call_id: functionCallId, name, arguments: argsJson } = event;
-        console.log(`[function] Function call: ${name} with args: ${argsJson}`);
-
-        if (name === "transfer_call") {
-          const args = JSON.parse(argsJson);
-
-          const result = await transferCall(callId, args.destination);
-
-          // Send function call result back
-          ws.send(JSON.stringify({
-            type: "conversation.item.create",
-            item: {
-              type: "function_call_output",
-              call_id: functionCallId,
-              output: JSON.stringify(result)
-            }
-          }));
-
-          // Request response generation
-          ws.send(JSON.stringify({ type: "response.create" }));
+    const connect = () => {
+      ws = new WebSocket(
+        `wss://api.openai.com/v1/realtime?call_id=${encodeURIComponent(callId)}`,
+        {
+          headers: {
+            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+          },
         }
-      }
-    });
+      );
 
-    ws.on("error", (error) => {
-      console.error(`[function] WebSocket error for call=${callId}:`, error.message);
-      resolve(false);
-    });
+      // Connection timeout (30 seconds)
+      connectionTimeout = setTimeout(() => {
+        logEvent('error', 'function', callId, 'WebSocket connection timeout');
+        ws?.close();
+      }, 30000);
 
-    ws.on("close", () => {
-      console.log(`[function] WebSocket disconnected for call=${callId}`);
-      resolve(true);
-    });
+      ws.on("open", () => {
+        clearTimeout(connectionTimeout);
+        reconnectAttempts = 0;
+        logEvent('info', 'function', callId, 'WebSocket connected');
+
+        // Initialize call state tracking
+        callStates.set(callId, {
+          started: Date.now(),
+          lastActivity: Date.now(),
+          messageCount: 0,
+          interrupted: false
+        });
+
+        // Heartbeat to detect stale connections
+        heartbeatInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.ping();
+          }
+        }, 15000);
+      });
+
+      ws.on("pong", () => {
+        if (VERBOSE_LOGGING) {
+          logEvent('debug', 'function', callId, 'Heartbeat pong received');
+        }
+      });
+
+      ws.on("message", async (data) => {
+        try {
+          const event = JSON.parse(data.toString());
+
+          // Update call state
+          const state = callStates.get(callId);
+          if (state) {
+            state.lastActivity = Date.now();
+            state.messageCount++;
+          }
+
+          // Handle interrupt/speech detection
+          if (event.type === "input_audio_buffer.speech_started") {
+            logEvent('info', 'interrupt', callId, 'User speech detected, clearing buffers');
+            if (state) {
+              state.interrupted = true;
+            }
+            // Clear audio buffer to prevent overlap
+            ws.send(JSON.stringify({
+              type: "input_audio_buffer.clear"
+            }));
+          }
+
+          // Handle speech stopped
+          if (event.type === "input_audio_buffer.speech_stopped") {
+            if (VERBOSE_LOGGING) {
+              logEvent('debug', 'interrupt', callId, 'User speech stopped');
+            }
+          }
+
+          // Track response completion
+          if (event.type === "response.done") {
+            logEvent('info', 'response', callId, 'AI response completed', {
+              messageCount: state?.messageCount || 0
+            });
+          }
+
+          // Handle function calls
+          if (event.type === "response.function_call_arguments.done") {
+            const { call_id: functionCallId, name, arguments: argsJson } = event;
+            logEvent('info', 'function', callId, `Function call: ${name}`, {
+              args: argsJson
+            });
+
+            if (name === "transfer_call") {
+              const args = JSON.parse(argsJson);
+              const transferStartTime = Date.now();
+
+              const result = await transferCall(callId, args.destination);
+
+              logEvent('info', 'transfer', callId, 'Transfer completed', {
+                destination: args.destination,
+                success: result.success,
+                durationMs: Date.now() - transferStartTime
+              });
+
+              // Send function call result back
+              ws.send(JSON.stringify({
+                type: "conversation.item.create",
+                item: {
+                  type: "function_call_output",
+                  call_id: functionCallId,
+                  output: JSON.stringify(result)
+                }
+              }));
+
+              // Request response generation
+              ws.send(JSON.stringify({ type: "response.create" }));
+            }
+          }
+        } catch (error) {
+          logEvent('error', 'function', callId, 'Error processing message', {
+            error: error.message,
+            stack: error.stack
+          });
+        }
+      });
+
+      ws.on("error", (error) => {
+        clearTimeout(connectionTimeout);
+        clearInterval(heartbeatInterval);
+        logEvent('error', 'function', callId, 'WebSocket error', {
+          error: error.message,
+          reconnectAttempts
+        });
+
+        // Attempt reconnection if possible
+        if (reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 5000);
+          logEvent('info', 'function', callId, 'Attempting reconnection', {
+            attempt: reconnectAttempts,
+            delayMs: backoffMs
+          });
+          setTimeout(connect, backoffMs);
+        } else {
+          logEvent('error', 'function', callId, 'Max reconnection attempts reached');
+          resolve(false);
+        }
+      });
+
+      ws.on("close", (code, reason) => {
+        clearTimeout(connectionTimeout);
+        clearInterval(heartbeatInterval);
+
+        const state = callStates.get(callId);
+        const sessionDuration = state ? Date.now() - state.started : 0;
+
+        logEvent('info', 'function', callId, 'WebSocket disconnected', {
+          code,
+          reason: reason.toString(),
+          sessionDurationMs: sessionDuration,
+          messageCount: state?.messageCount || 0
+        });
+
+        // Don't reconnect on normal closure
+        if (code === 1000) {
+          resolve(true);
+        } else if (reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const backoffMs = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 5000);
+          setTimeout(connect, backoffMs);
+        } else {
+          resolve(false);
+        }
+      });
+    };
+
+    connect();
   });
 }
 
 // Health check endpoint for Docker
 app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    activeCalls: callStates.size,
+    greetedCalls: greetedCalls.size,
+    activeFunctionHandlers: activeFunctionHandlers.size
+  });
+});
+
+// Cache refresh endpoint (consider adding authentication in production)
+app.post("/admin/refresh-cache", (req, res) => {
+  logEvent('info', 'admin', null, 'Cache refresh requested', {
+    sourceIp: req.ip
+  });
+
+  try {
+    clearCache();
+    res.status(200).json({
+      status: "success",
+      message: "Cache cleared successfully",
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logEvent('error', 'admin', null, 'Cache refresh failed', {
+      error: error.message
+    });
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 app.post("/openai-webhook", async (req, res) => {
   if (!verifySignature(req)) {
+    logEvent('error', 'webhook', null, 'Webhook rejected - invalid signature', {
+      sourceIp: req.ip
+    });
     return res.status(401).send("invalid signature");
   }
 
@@ -322,7 +611,7 @@ app.post("/openai-webhook", async (req, res) => {
     startFunctionHandler(data.call_id);
   }
 
-  // Cleanup events - remove call from greeted set
+  // Cleanup events - remove call from greeted set and call states
   const cleanupEvents = [
     "realtime.call.ended",
     "realtime.call.failed",
@@ -332,17 +621,73 @@ app.post("/openai-webhook", async (req, res) => {
 
   if (cleanupEvents.includes(type)) {
     const { call_id } = data;
+
+    // Get call state before cleanup
+    const state = callStates.get(call_id);
+    const callDuration = state ? Date.now() - state.started : 0;
+
+    logEvent('info', 'cleanup', call_id, `Cleaning up call (${type})`, {
+      eventType: type,
+      callDurationMs: callDuration,
+      messageCount: state?.messageCount || 0,
+      wasInterrupted: state?.interrupted || false
+    });
+
+    // Clean up all tracking
     greetedCalls.delete(call_id);
+    callStates.delete(call_id);
+
     return res.send("ok");
   }
 
   if (type.startsWith("realtime.")) {
-    console.log(`[unhandled] realtime event type=${type}, payload:`, JSON.stringify({ type, data }, null, 2));
+    logEvent('info', 'webhook', data?.call_id || null, 'Unhandled realtime event', {
+      eventType: type,
+      payload: data
+    });
   } else {
-    console.log(`[unhandled] non-realtime webhook:`, JSON.stringify(req.body, null, 2));
+    logEvent('warn', 'webhook', null, 'Non-realtime webhook received', {
+      eventType: type,
+      payload: req.body
+    });
   }
 
   res.send("ok");
 });
 
-app.listen(PORT, () => console.log(`Listening on :${PORT}`));
+// Graceful shutdown handler
+function gracefulShutdown(signal) {
+  logEvent('info', 'shutdown', null, `Received ${signal}, starting graceful shutdown`);
+
+  // Stop accepting new connections
+  server.close(() => {
+    logEvent('info', 'shutdown', null, 'HTTP server closed');
+
+    // Clean up call state
+    logEvent('info', 'shutdown', null, 'Cleaning up call state', {
+      activeCalls: callStates.size,
+      greetedCalls: greetedCalls.size,
+      activeFunctionHandlers: activeFunctionHandlers.size
+    });
+
+    greetedCalls.clear();
+    activeFunctionHandlers.clear();
+    callStates.clear();
+
+    logEvent('info', 'shutdown', null, 'Shutdown complete');
+    process.exit(0);
+  });
+
+  // Force shutdown after timeout
+  setTimeout(() => {
+    logEvent('error', 'shutdown', null, 'Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+const server = app.listen(PORT, () => {
+  logEvent('info', 'startup', null, 'Server started', { port: PORT });
+});
